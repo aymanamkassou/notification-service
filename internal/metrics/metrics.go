@@ -69,4 +69,59 @@ var (
 		},
 		[]string{"method", "path", "status"},
 	)
+
+	// PushSubscriptions tracks device subscriptions by user
+	PushSubscriptions = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "push_subscriptions_total",
+			Help: "Total number of device subscriptions registered",
+		},
+		[]string{"user_id"},
+	)
 )
+
+// IncHTTPRequestsTotal increments HTTP request counter
+func IncHTTPRequestsTotal(method, path string, status int) {
+	HTTPRequestsTotal.WithLabelValues(method, path, statusToString(status)).Inc()
+}
+
+// ObserveRequestDuration observes HTTP request duration
+func ObserveRequestDuration(method, path string, status int, duration float64) {
+	HTTPRequestDuration.WithLabelValues(method, path, statusToString(status)).Observe(duration)
+}
+
+// IncNotificationsSent increments notifications sent counter
+func IncNotificationsSent(notificationType string) {
+	NotificationsSent.WithLabelValues(notificationType).Inc()
+}
+
+// IncPushSubscriptionsTotal increments push subscriptions counter
+func IncPushSubscriptionsTotal(userID string) {
+	PushSubscriptions.WithLabelValues(userID).Inc()
+}
+
+// IncNotificationDeliveries increments delivery attempts counter
+func IncNotificationDeliveries(status, notificationType string) {
+	NotificationDeliveries.WithLabelValues(status, notificationType).Inc()
+}
+
+// ObserveNotificationLatency observes delivery latency
+func ObserveNotificationLatency(status, notificationType string, duration float64) {
+	NotificationLatency.WithLabelValues(status, notificationType).Observe(duration)
+}
+
+// statusToString converts HTTP status code to string
+func statusToString(status int) string {
+	switch status / 100 {
+	case 2:
+		return "2xx"
+	case 3:
+		return "3xx"
+	case 4:
+		return "4xx"
+	case 5:
+		return "5xx"
+	default:
+		return "unknown"
+	}
+}

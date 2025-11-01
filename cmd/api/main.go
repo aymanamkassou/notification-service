@@ -1,91 +1,101 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"log"
 	"net/http"
 	"os"
-	"strings"
+	"os/signal"
+	"syscall"
+	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/joho/godotenv"
+	"go.uber.org/zap"
+
+	"notifications/internal/config"
+	apihttp "notifications/internal/http"
+	"notifications/internal/logger"
+	"notifications/internal/repo"
 )
 
 func main() {
-	_ = godotenv.Load() // load .env if present (dev convenience)
+	// Load .env file if present (development convenience)
+	_ = godotenv.Load()
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	// Load configuration
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
 	}
-	vapidPub := os.Getenv("VAPID_PUBLIC_KEY")
-	allowed := splitAndTrim(os.Getenv("CORS_ALLOWED_ORIGINS"))
 
-	r := chi.NewRouter()
-	r.Use(corsMiddleware(allowed))
-
-	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-
-	r.Get("/v1/push/public-key", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if vapidPub == "" {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "VAPID_PUBLIC_KEY not configured"})
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]string{"publicKey": vapidPub})
-	})
-
-	log.Printf("notifications api listening on :%s", port)
-	if err := http.ListenAndServe(":"+port, r); err != nil {
-		log.Fatal(err)
+	// Initialize logger
+	appLogger, err := logger.New(cfg.LogLevel)
+	if err != nil {
+		log.Fatalf("Failed to initialize logger: %v", err)
 	}
-}
+	defer appLogger.Sync()
 
-func corsMiddleware(allowed []string) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			origin := r.Header.Get("Origin")
-			if originAllowed(origin, allowed) {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Vary", "Origin")
-				w.Header().Set("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Signature,X-Timestamp")
+	appLogger.Info("starting notifications api server",
+		zap.String("log_level", cfg.LogLevel),
+		zap.String("port", cfg.Port),
+	)
+
+	// Connect to database
+	appLogger.Info("connecting to database")
+	repository, err := repo.NewRepository(cfg.DatabaseURL)
+	if err != nil {
+		appLogger.Fatal("failed to connect to database", zap.Error(err))
+	}
+	defer repository.Close()
+
+	appLogger.Info("database connection established")
+
+	// Create HTTP router
+	router := apihttp.NewRouter(*cfg, repository, appLogger)
+
+	// Create HTTP server
+	server := &http.Server{
+		Addr:         ":" + cfg.Port,
+		Handler:      router,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Start server in a goroutine
+	serverErrors := make(chan error, 1)
+	go func() {
+		appLogger.Info("api server listening", zap.String("addr", server.Addr))
+		serverErrors <- server.ListenAndServe()
+	}()
+
+	// Wait for shutdown signal
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case err := <-serverErrors:
+		appLogger.Fatal("server error", zap.Error(err))
+
+	case sig := <-shutdown:
+		appLogger.Info("shutdown signal received",
+			zap.String("signal", sig.String()),
+		)
+
+		// Create shutdown context with timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// Attempt graceful shutdown
+		if err := server.Shutdown(ctx); err != nil {
+			appLogger.Error("graceful shutdown failed, forcing close",
+				zap.Error(err),
+			)
+			if err := server.Close(); err != nil {
+				appLogger.Error("server close error", zap.Error(err))
 			}
-			if r.Method == http.MethodOptions {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
-}
-
-func originAllowed(origin string, allowed []string) bool {
-	if origin == "" {
-		return false
-	}
-	for _, a := range allowed {
-		if a == "*" || strings.EqualFold(a, origin) {
-			return true
 		}
-	}
-	return false
-}
 
-func splitAndTrim(csv string) []string {
-	if csv == "" {
-		return nil
+		appLogger.Info("server stopped gracefully")
 	}
-	parts := strings.Split(csv, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if s := strings.TrimSpace(p); s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
 }
