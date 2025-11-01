@@ -13,11 +13,12 @@ import (
 	"notifications/internal/auth"
 	"notifications/internal/config"
 	"notifications/internal/middleware"
+	"notifications/internal/queue"
 	"notifications/internal/repo"
 )
 
 // NewRouter wires routes and middleware.
-func NewRouter(cfg config.Config, r *repo.Repository, logger *zap.Logger) http.Handler {
+func NewRouter(cfg config.Config, r *repo.Repository, queueClient *queue.Client, logger *zap.Logger) http.Handler {
 	mux := chi.NewRouter()
 
 	// Global middleware
@@ -31,7 +32,7 @@ func NewRouter(cfg config.Config, r *repo.Repository, logger *zap.Logger) http.H
 	mux.Get("/v1/push/public-key", vapidPublicKeyHandler(cfg))
 
 	// Protected routes (require HMAC auth)
-	h := NewHandler(r, logger)
+	h := NewHandler(r, queueClient, logger)
 	mux.Group(func(protected chi.Router) {
 		protected.Use(auth.VerifyHMACMiddleware([]byte(cfg.HMACSecret), 5*time.Minute))
 

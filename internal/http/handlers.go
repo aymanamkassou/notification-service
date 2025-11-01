@@ -1,6 +1,7 @@
 package apihttp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -12,20 +13,23 @@ import (
 	"go.uber.org/zap"
 
 	"notifications/internal/metrics"
+	"notifications/internal/queue"
 	"notifications/internal/repo"
 )
 
 // Handler holds dependencies for HTTP handlers.
 type Handler struct {
-	repo   *repo.Repository
-	logger *zap.Logger
+	repo        *repo.Repository
+	logger      *zap.Logger
+	queueClient *queue.Client
 }
 
 // NewHandler creates a new Handler.
-func NewHandler(r *repo.Repository, logger *zap.Logger) *Handler {
+func NewHandler(r *repo.Repository, queueClient *queue.Client, logger *zap.Logger) *Handler {
 	return &Handler{
-		repo:   r,
-		logger: logger,
+		repo:        r,
+		logger:      logger,
+		queueClient: queueClient,
 	}
 }
 
@@ -269,6 +273,19 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		zap.Int("recipients", recipientCount),
 	)
 
+	// Enqueue delivery tasks for each recipient
+	priority := queue.PriorityNormal
+	if req.Priority != nil {
+		priority = *req.Priority
+	}
+	ttl := 3600 // Default 1 hour
+	if req.TTLSeconds != nil {
+		ttl = *req.TTLSeconds
+	}
+
+	// Enqueue tasks asynchronously for each recipient's active subscriptions
+	go h.enqueueDeliveryTasks(ctx, notif.ID, req.UserIDs, priority, ttl)
+
 	resp := SendNotificationResponse{
 		ID:             notif.ID,
 		Type:           notif.Type,
@@ -425,4 +442,45 @@ func (h *Handler) respondError(w http.ResponseWriter, status int, message, code 
 		Code:    code,
 		Details: details,
 	})
+}
+
+// enqueueDeliveryTasks enqueues notification delivery tasks for all active subscriptions of the recipients
+func (h *Handler) enqueueDeliveryTasks(ctx context.Context, notificationID uuid.UUID, userIDs []string, priority string, ttl int) {
+	for _, userID := range userIDs {
+		// Get all active subscriptions for this user
+		subscriptions, err := h.repo.ListActiveDeviceSubscriptionsByUser(ctx, userID)
+		if err != nil {
+			h.logger.Error("failed to get active subscriptions for user",
+				zap.String("user_id", userID),
+				zap.String("notification_id", notificationID.String()),
+				zap.Error(err),
+			)
+			continue
+		}
+
+		// Enqueue a task for each subscription
+		for _, sub := range subscriptions {
+			if err := h.queueClient.EnqueueDeliverNotification(
+				ctx,
+				notificationID,
+				userID,
+				sub.ID,
+				priority,
+				ttl,
+			); err != nil {
+				h.logger.Error("failed to enqueue delivery task",
+					zap.String("notification_id", notificationID.String()),
+					zap.String("user_id", userID),
+					zap.String("subscription_id", sub.ID.String()),
+					zap.Error(err),
+				)
+			} else {
+				h.logger.Debug("enqueued delivery task",
+					zap.String("notification_id", notificationID.String()),
+					zap.String("user_id", userID),
+					zap.String("subscription_id", sub.ID.String()),
+				)
+			}
+		}
+	}
 }

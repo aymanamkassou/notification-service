@@ -15,6 +15,7 @@ import (
 	"notifications/internal/config"
 	apihttp "notifications/internal/http"
 	"notifications/internal/logger"
+	"notifications/internal/queue"
 	"notifications/internal/repo"
 )
 
@@ -50,8 +51,15 @@ func main() {
 
 	appLogger.Info("database connection established")
 
+	// Initialize queue client
+	appLogger.Info("connecting to Redis queue")
+	queueClient := queue.NewClient(cfg.RedisAddr)
+	defer queueClient.Close()
+
+	appLogger.Info("queue client initialized")
+
 	// Create HTTP router
-	router := apihttp.NewRouter(*cfg, repository, appLogger)
+	router := apihttp.NewRouter(*cfg, repository, queueClient, appLogger)
 
 	// Create HTTP server
 	server := &http.Server{
